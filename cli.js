@@ -301,30 +301,88 @@ function run(cmd, args, allowFail = false) {
 }
 
 // ─── update ────────────────────────────────────────────────────────────────────
-function cmdUpdate() {
-  console.log(`${C.bold}Updating Stoa…${C.reset}`);
-  if (!fs.existsSync(path.join(ROOT, '.git'))) {
-    console.log(bad('not a git checkout — cannot pull. Update manually.'));
-    return;
+// Compare dotted versions: is `a` newer than `b`? ("v1.2.3" / "1.2.3" both ok)
+function versionGt(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(Number);
+  const pb = String(b).replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
   }
+  return false;
+}
+
+// Which GitHub repo to check for releases: STOA_REPO env → .stoa-source file
+// (written by the installer / baked into the release tarball) → git origin.
+function sourceSlug() {
+  if (process.env.STOA_REPO) return process.env.STOA_REPO.trim();
+  try { const s = fs.readFileSync(path.join(ROOT, '.stoa-source'), 'utf8').trim(); if (s) return s; } catch {}
+  const o = spawnSync('git', ['-C', ROOT, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).stdout || '';
+  const m = o.match(/github\.com[:/]+([^/]+\/[^/.\s]+)/);
+  return m ? m[1] : null;
+}
+
+async function cmdUpdate(args) {
+  const checkOnly = args.includes('--check');
+  console.log(`${C.bold}Updating Stoa…${C.reset}`);
+  if (fs.existsSync(path.join(ROOT, '.git'))) return updateFromGit();
+  return updateFromRelease(checkOnly);
+}
+
+// Development checkout → git pull + npm install + restart.
+function updateFromGit() {
   const before = pkg().version;
   if (!run('git', ['pull', '--ff-only'])) {
     console.log(bad('git pull failed (local changes or non-fast-forward). Resolve, then retry.'));
     return;
   }
-  // Reinstall deps only if the lockfile actually changed in this pull.
   const changed = spawnSync('git', ['diff', '--name-only', 'HEAD@{1}', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout || '';
-  if (/package(-lock)?\.json/.test(changed)) {
-    console.log(`${C.gray}Dependencies changed — running npm install…${C.reset}`);
-    run('npm', ['install']);
-  }
+  if (/package(-lock)?\.json/.test(changed)) { console.log(`${C.gray}Dependencies changed — npm install…${C.reset}`); run('npm', ['install']); }
   const after = pkg().version;
   console.log(ok(before === after ? `already at v${after}` : `v${before} → v${after}`));
-
   rebuildNative();
-  console.log(`${C.gray}Restarting gateway (if enabled)…${C.reset}`);
-  require('./gateway').restart().catch(() => warn('Gateway not enabled — restart your server manually to apply.'));
-  console.log(`${C.gray}Connected agents auto-update within ~2 minutes.${C.reset}`);
+  require('./gateway').restart().catch(() => warn('Gateway not enabled — restart manually.'));
+}
+
+// Installed (no .git) → check the latest GitHub release and download its tarball.
+async function updateFromRelease(checkOnly) {
+  const slug = sourceSlug();
+  if (!slug) { console.log(bad('cannot determine source repo — set STOA_REPO=owner/repo and retry.')); return; }
+  const cur = pkg().version;
+  console.log(`${C.gray}Current v${cur} — checking ${slug} releases…${C.reset}`);
+
+  let rel;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${slug}/releases/latest`, {
+      headers: { 'User-Agent': 'stoa-cli', 'Accept': 'application/vnd.github+json' },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    rel = await r.json();
+  } catch (e) { console.log(bad(`release check failed: ${e.message}`)); return; }
+
+  const latest = (rel.tag_name || '').replace(/^v/, '');
+  if (!latest) { console.log(bad('no published release found.')); return; }
+  if (!versionGt(latest, cur)) { console.log(ok(`already up to date (v${cur}; latest v${latest})`)); return; }
+
+  console.log(`${C.cyan}Update available: v${cur} → v${latest}${C.reset}`);
+  if (checkOnly) { console.log(`${C.gray}Run \`stoa update\` to apply.${C.reset}`); return; }
+
+  const asset = (rel.assets || []).find((a) => /\.tar\.gz$/.test(a.name));
+  if (!asset) { console.log(bad('release has no .tar.gz asset to install.')); return; }
+
+  const tmp = path.join(os.tmpdir(), `stoa-update-${latest}.tar.gz`);
+  console.log(`${C.gray}Downloading ${asset.name}…${C.reset}`);
+  if (!run('curl', ['-fsSL', '-o', tmp, asset.browser_download_url])) { console.log(bad('download failed.')); return; }
+  console.log(`${C.gray}Extracting into ${ROOT}…${C.reset}`);
+  if (!run('tar', ['xzf', tmp, '-C', ROOT, '--strip-components=1'])) { console.log(bad('extract failed.')); return; }
+  try { fs.unlinkSync(tmp); } catch {}
+
+  console.log(`${C.gray}Installing dependencies…${C.reset}`);
+  run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund']);
+  rebuildNative();
+  console.log(`${C.gray}Restarting gateway…${C.reset}`);
+  require('./gateway').restart().catch(() => warn('Gateway not enabled — restart manually.'));
+  console.log(ok(`updated v${cur} → v${latest}`));
 }
 
 // ─── doctor ──────────────────────────────────────────────────────────────────
@@ -464,7 +522,7 @@ function cmdHelp(args) {
     link:    'stoa link\n  Make the `stoa` command available on PATH (npm link, or a symlink into ~/.local/bin).',
     dashboard: 'stoa dashboard\n  Open the web dashboard in your browser. Starts the gateway first if nothing is running.\n  Targets the installed server (~/.stoa, default :3030), else the dev server from .env.',
     gateway: 'stoa gateway <enable|disable|start|stop|restart|status|logs>\n  Run the server as a native background service (launchd on macOS, systemd on Linux).\n  enable  = start now + autostart on login/boot + restart on crash (data in ~/.stoa/server)\n  disable = stop + remove autostart.  logs -f to follow.  No PM2 required.',
-    update:  'stoa update\n  git pull --ff-only, npm install if deps changed, then restart the gateway.\n  Connected agents auto-update within ~2 minutes.',
+    update:  'stoa update [--check]\n  Dev checkout: git pull + npm install + restart.\n  Installed: check the latest GitHub release (from .stoa-source / STOA_REPO), and if the\n  tag is newer than the current version, download its tarball, install, and restart.\n  --check only reports whether an update is available.',
     doctor:  'stoa doctor\n  Check mode, Node version, dependencies, .env, database, server reachability, and AI backend CLIs.',
     config:  'stoa config <list|get KEY|set KEY VALUE>\n  Read or write .env values (secrets are masked in list).',
     rooms:   'stoa rooms\n  List active rooms by reading the local SQLite DB (run on the server machine).',
@@ -510,7 +568,7 @@ function cmdVersion() {
     case 'uninstall':            await cmdUninstall(args); break;
     case 'link':                       linkCommand(); break;
     case 'gateway':              await cmdGateway(args); break;
-    case 'update':                     cmdUpdate(); break;
+    case 'update':               await cmdUpdate(args); break;
     case 'doctor':               await cmdDoctor(); break;
     case 'config':                     cmdConfig(args); break;
     case 'rooms':                      cmdRooms(); break;

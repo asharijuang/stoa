@@ -8,8 +8,21 @@
 # which links the `stoa` command and registers the background gateway (Scheduled Task).
 
 $ErrorActionPreference = "Stop"
-$RepoUrl    = if ($env:STOA_REPO_URL) { $env:STOA_REPO_URL } else { "https://github.com/a-athaullah/stoa" }
-$InstallDir = if ($env:STOA_DIR)      { $env:STOA_DIR }      else { "$env:USERPROFILE\stoa" }
+
+# Repo to clone (only used when not already inside a checkout). Auto-detects from
+# this script's git origin so it follows whatever fork you cloned; falls back to
+# upstream. Override with STOA_REPO_URL.
+function Get-RepoUrl {
+  if ($env:STOA_REPO_URL) { return $env:STOA_REPO_URL }
+  $o = $null
+  if ($PSScriptRoot) { $o = (git -C $PSScriptRoot remote get-url origin 2>$null) }
+  if (-not $o) { $o = (git remote get-url origin 2>$null) }
+  if ($o) { return $o } else { return "https://github.com/a-athaullah/stoa" }
+}
+$RepoUrl    = Get-RepoUrl
+# Managed app location (Hermes-style): code in ~/.stoa/app, data in ~/.stoa/server.
+$InstallDir = if ($env:STOA_DIR) { $env:STOA_DIR } else { "$env:USERPROFILE\.stoa\app" }
+$RepoSlug   = ($RepoUrl -replace '.*github\.com[:/]+', '') -replace '\.git$', ''
 
 Write-Host "=== Stoa installer (Windows) ==="
 
@@ -35,6 +48,9 @@ if ((Test-Path ".\cli.js") -and (Test-Path ".\server.js")) {
   git clone $RepoUrl $InstallDir
   Set-Location $InstallDir
 }
+
+# Record the source repo so `stoa update` knows which GitHub releases to check.
+if ($RepoSlug) { Set-Content -Path "$InstallDir\.stoa-source" -Value $RepoSlug -NoNewline }
 
 Write-Host "[2/3] Installing dependencies (npm install)..."
 npm install --no-audit --no-fund

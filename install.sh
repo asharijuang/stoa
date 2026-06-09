@@ -14,8 +14,20 @@
 
 set -e
 
-REPO_URL="${STOA_REPO_URL:-https://github.com/a-athaullah/stoa}"
-INSTALL_DIR="${STOA_DIR:-$HOME/stoa}"
+# Repo to clone (only used when not already inside a checkout). Auto-detects from
+# this script's git origin so it follows whatever fork you cloned; falls back to
+# upstream. Override with STOA_REPO_URL.
+detect_repo() {
+  if [ -n "${STOA_REPO_URL:-}" ]; then echo "$STOA_REPO_URL"; return; fi
+  local dir o
+  dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+  o="$(git -C "${dir:-.}" remote get-url origin 2>/dev/null || git remote get-url origin 2>/dev/null || true)"
+  if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/a-athaullah/stoa"; fi
+}
+REPO_URL="$(detect_repo)"
+# Managed app location (Hermes-style): code lives in ~/.stoa/app, data in ~/.stoa/server.
+INSTALL_DIR="${STOA_DIR:-$HOME/.stoa/app}"
+REPO_SLUG="$(echo "$REPO_URL" | sed -E 's#.*github\.com[:/]+##; s#\.git$##')"
 
 # ── Detect OS ──────────────────────────────────────────────────────────────────
 case "$(uname -s)" in
@@ -65,6 +77,9 @@ else
   git clone "${REPO_URL}" "${INSTALL_DIR}"
   cd "${INSTALL_DIR}"
 fi
+
+# Record the source repo so `stoa update` knows which GitHub releases to check.
+[ -n "${REPO_SLUG}" ] && echo "${REPO_SLUG}" > "${INSTALL_DIR}/.stoa-source" 2>/dev/null || true
 
 # ── Install dependencies ──────────────────────────────────────────────────────────
 echo "[2/3] Installing dependencies (npm install)…"

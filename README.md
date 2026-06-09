@@ -66,7 +66,7 @@ Agents run independently — each has its own working directory, skills, and ses
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20+ (**Node 24 recommended** — releases are built and tested on it, and `better-sqlite3` ships prebuilt binaries for it so no compiler is needed)
 - [Claude Code CLI](https://claude.ai/code) and/or [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed and authenticated
 
 ### Install & Run
@@ -117,6 +117,30 @@ Default login at `http://localhost:3030`:
 - **Password:** `stoa2026!`
 
 > **Background service.** `stoa install` registers a native service (launchd on macOS, systemd on Linux) that keeps the server alive across crashes and reboots — no PM2 required. It runs in *installed* mode: code stays in the repo, but data lives in `~/.stoa/server`. The web UI is always at `http://localhost:3030`; open it anytime with `stoa dashboard` and close the tab whenever — the server keeps running. To stop it: `stoa gateway stop`. For development instead, run `node server.js` (foreground, data in the repo).
+
+### Low-memory servers (install from a release)
+
+On a small VPS (e.g. 2 GB RAM) the frontend build (esbuild) can run out of memory. You don't need to build there — each tagged release ships a ready-to-use tarball with `public/dist/` already built. Install from it instead:
+
+```bash
+VERSION=v0.1.0
+mkdir -p ~/.stoa/app
+curl -fsSL https://github.com/asharijuang/stoa/releases/download/$VERSION/stoa-$VERSION.tar.gz \
+  | tar xz -C ~/.stoa/app --strip-components=1     # code lives in ~/.stoa/app (managed, like Hermes)
+cd ~/.stoa/app
+npm install --omit=dev          # skips esbuild; better-sqlite3 fetches a prebuilt binary (no compile)
+node cli.js install             # link `stoa` + start the gateway (serves the prebuilt minified bundles)
+```
+
+The app code lives in `~/.stoa/app` and data in `~/.stoa/server` — you don't keep a loose source folder around. To upgrade later, just run **`stoa update`**: it checks the latest GitHub release, and if the tag is newer than your installed version, downloads and installs it (then restarts the gateway). `stoa uninstall` removes everything under `~/.stoa`.
+
+`node_modules` is **not** shipped — it contains the native `better-sqlite3`, which is OS/arch-specific — so the server still runs a light `npm install --omit=dev` (no esbuild, no C++ compile). Use **Node 24** on the server (Linux x64/arm64) so `better-sqlite3` downloads a prebuilt binary instead of compiling. If even that is tight, add swap:
+
+```bash
+sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+```
+
+Releases are produced by `.github/workflows/release.yml` — push a tag (`git tag v0.1.0 && git push origin v0.1.0`) to build and publish one.
 
 ### Adding AI Agents
 
