@@ -22,7 +22,7 @@ detect_repo() {
   local dir o
   dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
   o="$(git -C "${dir:-.}" remote get-url origin 2>/dev/null || git remote get-url origin 2>/dev/null || true)"
-  if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/a-athaullah/stoa"; fi
+  if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/asharijuang/stoa"; fi
 }
 REPO_URL="$(detect_repo)"
 # Managed app location (Hermes-style): code lives in ~/.stoa/app, data in ~/.stoa/server.
@@ -64,26 +64,31 @@ fi
 echo "ok: node $(node -v), npm $(npm -v), git present"
 
 # ── Get the code ────────────────────────────────────────────────────────────────
-# If run from inside a checkout, use it. Otherwise clone (or update) into INSTALL_DIR.
+# Priority: current checkout (dev) → prebuilt GitHub release tarball (no build!) → git clone.
 if [ -f "./cli.js" ] && [ -f "./server.js" ]; then
   INSTALL_DIR="$(pwd)"
   echo "[1/3] Using current checkout: ${INSTALL_DIR}"
 elif [ -d "${INSTALL_DIR}/.git" ]; then
   echo "[1/3] Updating existing clone: ${INSTALL_DIR}"
   git -C "${INSTALL_DIR}" pull --ff-only || echo "  (pull skipped — local changes)"
-  cd "${INSTALL_DIR}"
 else
-  echo "[1/3] Cloning ${REPO_URL} → ${INSTALL_DIR}"
-  git clone "${REPO_URL}" "${INSTALL_DIR}"
-  cd "${INSTALL_DIR}"
+  ASSET_URL="$(curl -fsSL "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null | grep -oE 'https://[^"]+\.tar\.gz' | head -1)"
+  mkdir -p "${INSTALL_DIR}"
+  if [ -n "${ASSET_URL}" ]; then
+    echo "[1/3] Installing from latest release — prebuilt, no build: ${ASSET_URL##*/}"
+    curl -fsSL "${ASSET_URL}" | tar xz -C "${INSTALL_DIR}" --strip-components=1
+  else
+    echo "[1/3] No release found for ${REPO_SLUG} — cloning source from ${REPO_URL}"
+    rmdir "${INSTALL_DIR}" 2>/dev/null || true
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
+  fi
+  [ -n "${REPO_SLUG}" ] && echo "${REPO_SLUG}" > "${INSTALL_DIR}/.stoa-source" 2>/dev/null || true
 fi
+cd "${INSTALL_DIR}"
 
-# Record the source repo so `stoa update` knows which GitHub releases to check.
-[ -n "${REPO_SLUG}" ] && echo "${REPO_SLUG}" > "${INSTALL_DIR}/.stoa-source" 2>/dev/null || true
-
-# ── Install dependencies ──────────────────────────────────────────────────────────
-echo "[2/3] Installing dependencies (npm install)…"
-npm install --no-audit --no-fund
+# ── Install dependencies (runtime only — no esbuild, no compile spike) ───────────
+echo "[2/3] Installing dependencies…"
+npm install --omit=dev --no-audit --no-fund
 
 # ── Bootstrap: link the `stoa` command + enable the gateway ───────────────────────
 echo "[3/3] Bootstrapping (link command + enable gateway)…"

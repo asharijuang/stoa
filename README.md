@@ -71,7 +71,7 @@ Agents run independently — each has its own working directory, skills, and ses
 
 ### Install & Run
 
-One line — auto-detects your OS, fetches the code, installs deps, links the `stoa` command, and starts the background service:
+**One command.** It auto-detects your OS, downloads the latest **prebuilt** release into `~/.stoa/app`, installs runtime deps, links the `stoa` command, and starts the background service. **No build step** — fine on a 2 GB server:
 
 **Linux / macOS (and Windows via WSL or Git Bash):**
 ```bash
@@ -83,64 +83,37 @@ curl -fsSL https://raw.githubusercontent.com/a-athaullah/stoa/master/install.sh 
 irm https://raw.githubusercontent.com/a-athaullah/stoa/master/install.ps1 | iex
 ```
 
-Then **run the server (gateway)** and open the dashboard:
+Then:
 ```bash
-stoa gateway status     # the installer already started it — this just confirms it's running
-stoa gateway start      # (only if it's not running) start the server in the background
-stoa dashboard          # open the web UI in your browser
+stoa dashboard          # open the web UI → http://localhost:3030
 ```
 
-The **gateway is the server**. `stoa install` already starts it and sets it to auto-start on login, so on a normal machine you go straight to `stoa dashboard`. Manage it any time with:
+Default login: **`stoa@stoa.com`** / **`stoa2026!`** (change via `~/.stoa/server/.env`).
 
+That's it. Code lives in `~/.stoa/app`, data in `~/.stoa/server` — no loose source folder to manage. The installer pulls the release tarball with `public/dist/` already built, so there's **no `npm run build`, no esbuild, no compiler** on your server. On Linux use **Node 24** so `better-sqlite3` fetches a prebuilt binary. If `npm install` is still tight on RAM, add swap: `sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
+
+**The gateway is the server** — `install` already started it and set it to autostart on login/boot. Day to day:
 ```bash
-stoa gateway start | stop | restart | status | logs
+stoa dashboard                          # open the web UI (close the tab anytime — server keeps running)
+stoa update                             # upgrade to the latest GitHub release (compares the tag)
+stoa gateway start|stop|restart|status|logs
+stoa uninstall                          # remove ~/.stoa (offers a backup first)
 ```
+
+> **Installing from a fork?** Point the installer at it — it reads that repo's latest GitHub *release*:
+> `curl -fsSL https://raw.githubusercontent.com/OWNER/stoa/master/install.sh | STOA_REPO=OWNER/stoa bash`
 
 <details>
-<summary>Or install manually (clone first)</summary>
+<summary>Develop from source (no release needed)</summary>
 
 ```bash
-git clone https://github.com/a-athaullah/stoa
-cd stoa
+git clone https://github.com/a-athaullah/stoa && cd stoa
 npm install
-node cli.js install        # bootstrap: link the `stoa` command + start the gateway (server)
-stoa gateway status        # confirm the server is running
-stoa dashboard             # open the web UI in your browser
+node server.js          # dev mode: data in the repo, serves raw /js, port from .env
 ```
 
-The bootstrap is `node cli.js install` (not `stoa install`) because the `stoa` command doesn't exist on a fresh machine yet — that step is what creates it, **and starts the server (gateway)**. After it, just use `stoa …`. The installers above run exactly this for you.
+In development you run from the checkout (foreground); the `stoa gateway` service is for the installed/production setup. `npm run build` produces the minified `public/dist/` (served only when `NODE_ENV=production`). Releases are built and published by `.github/workflows/release.yml` on each `v*` tag.
 </details>
-
-Default login at `http://localhost:3030`:
-
-- **Email:** `stoa@stoa.com`
-- **Password:** `stoa2026!`
-
-> **Background service.** `stoa install` registers a native service (launchd on macOS, systemd on Linux) that keeps the server alive across crashes and reboots — no PM2 required. It runs in *installed* mode: code stays in the repo, but data lives in `~/.stoa/server`. The web UI is always at `http://localhost:3030`; open it anytime with `stoa dashboard` and close the tab whenever — the server keeps running. To stop it: `stoa gateway stop`. For development instead, run `node server.js` (foreground, data in the repo).
-
-### Low-memory servers (install from a release)
-
-On a small VPS (e.g. 2 GB RAM) the frontend build (esbuild) can run out of memory. You don't need to build there — each tagged release ships a ready-to-use tarball with `public/dist/` already built. Install from it instead:
-
-```bash
-VERSION=v0.1.0
-mkdir -p ~/.stoa/app
-curl -fsSL https://github.com/asharijuang/stoa/releases/download/$VERSION/stoa-$VERSION.tar.gz \
-  | tar xz -C ~/.stoa/app --strip-components=1     # code lives in ~/.stoa/app (managed, like Hermes)
-cd ~/.stoa/app
-npm install --omit=dev          # skips esbuild; better-sqlite3 fetches a prebuilt binary (no compile)
-node cli.js install             # link `stoa` + start the gateway (serves the prebuilt minified bundles)
-```
-
-The app code lives in `~/.stoa/app` and data in `~/.stoa/server` — you don't keep a loose source folder around. To upgrade later, just run **`stoa update`**: it checks the latest GitHub release, and if the tag is newer than your installed version, downloads and installs it (then restarts the gateway). `stoa uninstall` removes everything under `~/.stoa`.
-
-`node_modules` is **not** shipped — it contains the native `better-sqlite3`, which is OS/arch-specific — so the server still runs a light `npm install --omit=dev` (no esbuild, no C++ compile). Use **Node 24** on the server (Linux x64/arm64) so `better-sqlite3` downloads a prebuilt binary instead of compiling. If even that is tight, add swap:
-
-```bash
-sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-```
-
-Releases are produced by `.github/workflows/release.yml` — push a tag (`git tag v0.1.0 && git push origin v0.1.0`) to build and publish one.
 
 ### Adding AI Agents
 
