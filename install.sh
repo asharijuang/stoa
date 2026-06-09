@@ -90,13 +90,22 @@ cd "${INSTALL_DIR}"
 echo "[2/3] Installing dependencies…"
 npm install --omit=dev --no-audit --no-fund
 
-# ── Bootstrap: link the `stoa` command + enable the gateway ───────────────────────
-echo "[3/3] Bootstrapping (link command + enable gateway)…"
-node cli.js install
+# ── Bootstrap: link command + enable gateway + create .env/config.yaml + login ────
+# `node cli.js install` also creates .env + config.yaml and asks for the dashboard
+# email/password. When piped (curl | bash) our stdin is the script, so connect the
+# installer to the real terminal (/dev/tty) to keep those prompts interactive.
+echo "[3/3] Bootstrapping (link command, enable gateway, configure login)…"
+if [ -e /dev/tty ]; then
+  node cli.js install < /dev/tty
+else
+  echo "  (no terminal available — keeping the default login; run 'stoa setup' later to change it)"
+  node cli.js install
+fi
 
 echo ""
 echo "=== Done ==="
 echo "Open the dashboard:  stoa dashboard"
+echo "Change the login:    stoa setup        (then: stoa gateway restart)"
 echo "Check status:        stoa gateway status"
 echo "Stop the server:     stoa gateway stop"
 echo ""

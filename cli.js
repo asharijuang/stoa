@@ -36,13 +36,15 @@ const warn = (s) => `${C.yellow}⚠${C.reset} ${s}`;
 
 // ─── .env helpers ─────────────────────────────────────────────────────────────
 // Resolved by paths.js so the CLI reads the same .env the server does
-// (repo .env in dev, ~/.stoa/server/.env when installed).
-const ENV_PATH = paths.envFile();
+// (repo .env in dev, ~/.stoa/server/.env when installed). Resolved lazily — the
+// `install` flow flips STOA_DEV=0 so it configures the *installed* server (the one
+// the gateway runs), not the dev repo, even when run from a git checkout.
+function envFilePath() { return paths.envFile(); }
 
 function readEnv() {
   const out = {};
-  if (!fs.existsSync(ENV_PATH)) return out;
-  for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
+  if (!fs.existsSync(envFilePath())) return out;
+  for (const line of fs.readFileSync(envFilePath(), 'utf8').split('\n')) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
     const i = t.indexOf('=');
@@ -54,11 +56,23 @@ function readEnv() {
 
 // Same upsert semantics as server.js writeEnv().
 function writeEnvKey(key, value) {
-  let content = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
+  let content = fs.existsSync(envFilePath()) ? fs.readFileSync(envFilePath(), 'utf8') : '';
   const re = new RegExp(`^${key}=.*$`, 'm');
   if (re.test(content)) content = content.replace(re, `${key}=${value}`);
   else content = content.trimEnd() + `\n${key}=${value}\n`;
-  fs.writeFileSync(ENV_PATH, content, 'utf8');
+  fs.writeFileSync(envFilePath(), content, 'utf8');
+}
+
+// Create .env from .env.example if it's missing (works in both dev and installed
+// mode — config.ensureEnvFile() only seeds the installed location).
+function ensureEnvFile() {
+  if (fs.existsSync(envFilePath())) return;
+  const example = path.join(ROOT, '.env.example');
+  fs.mkdirSync(path.dirname(envFilePath()), { recursive: true });
+  const content = fs.existsSync(example)
+    ? fs.readFileSync(example, 'utf8')
+    : '# Stoa secrets — see .env.example. Set STOA_EMAIL / STOA_PASSWORD for the dashboard login.\n';
+  fs.writeFileSync(envFilePath(), content, 'utf8');
 }
 
 function getPort() {
@@ -158,12 +172,87 @@ function rebuildNative() {
   else console.log(warn('better-sqlite3 rebuild failed — run `npm rebuild better-sqlite3` if the server won\'t start'));
 }
 
+// ─── setup: create .env + config.yaml and choose the dashboard login ────────────
+// Read one line of input. Returns '' on empty (caller applies the default).
+function prompt(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (a) => { rl.close(); resolve((a || '').trim()); });
+  });
+}
+
+// Read a line without echoing the typed characters (passwords). Re-prints the
+// prompt on each keystroke so nothing leaks to the screen.
+function promptHidden(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const mask = () => rl.output.write('\x1b[2K\x1b[200D' + question);
+    rl.input.on('data', mask);
+    rl.question(question, (value) => {
+      rl.input.removeListener('data', mask);
+      rl.output.write('\n');
+      rl.close();
+      resolve((value || '').trim());
+    });
+  });
+}
+
+// Ensure .env + config.yaml exist (seeded from the *.example files) and let the
+// user pick the dashboard email/password, written to .env as STOA_EMAIL/STOA_PASSWORD.
+async function cmdSetup(opts = {}) {
+  const interactive = opts.interactive !== false && !!process.stdin.isTTY;
+
+  // 1) Make sure both config files exist. config.yaml is seeded from config.js
+  //    DEFAULTS; .env is copied from .env.example.
+  require('./config').ensureFile();
+  ensureEnvFile();
+  console.log(ok(`config.yaml ready (${require('./config').configPath().replace(os.homedir(), '~')})`));
+  console.log(ok(`.env ready (${envFilePath().replace(os.homedir(), '~')})`));
+
+  const env = readEnv();
+  const currentEmail = env.STOA_EMAIL || 'stoa@stoa.com';
+
+  if (!interactive) {
+    console.log(warn('non-interactive shell — keeping the existing/default login.'));
+    console.log(`${C.gray}Set it later with: ${C.reset}${C.cyan}stoa setup${C.reset}`);
+    return { email: currentEmail };
+  }
+
+  console.log(`\n${C.bold}Dashboard account${C.reset} ${C.gray}(used to log in to the web UI)${C.reset}`);
+  const email = (await prompt(`  Email [${currentEmail}]: `)) || currentEmail;
+
+  let password = '';
+  while (!password) {
+    password = await promptHidden('  Password: ');
+    if (!password) { console.log(warn('  password cannot be empty')); continue; }
+    const confirm = await promptHidden('  Confirm password: ');
+    if (confirm !== password) { console.log(bad('  passwords do not match — try again')); password = ''; }
+  }
+
+  writeEnvKey('STOA_EMAIL', email);
+  writeEnvKey('STOA_PASSWORD', password);
+  console.log(ok(`saved login for ${C.cyan}${email}${C.reset} to .env`));
+  return { email };
+}
+
 async function cmdInstall() {
   console.log(`${C.bold}Installing Stoa…${C.reset}`);
+  // The gateway always runs the server in installed mode (STOA_DEV=0, data in
+  // ~/.stoa/server). Match that here so .env + config.yaml land where the gateway
+  // reads them — even when `install` runs from a git checkout (which is dev mode).
+  process.env.STOA_DEV = '0';
   linkCommand();
   rebuildNative();
+  // Create .env + config.yaml and choose the dashboard login *before* the server
+  // boots — server.js seeds the auth user from .env on its first start.
+  const { email } = await cmdSetup({ interactive: process.stdin.isTTY });
   await require('./gateway').enable();
-  console.log(`${C.gray}Done. Open the dashboard: ${C.reset}${C.cyan}stoa dashboard${C.reset}`);
+
+  // "Log in with that account" — open the dashboard in the browser.
+  const url = `http://localhost:${getPort()}`;
+  console.log(`\n${C.green}${C.bold}Done.${C.reset} Dashboard: ${C.cyan}${url}${C.reset}`);
+  console.log(`Log in as ${C.cyan}${email}${C.reset} with the password you just set.`);
+  openBrowser(url);
 }
 
 // ─── uninstall: remove the service + command + ~/.stoa (with optional backup) ───
@@ -412,7 +501,7 @@ async function cmdDoctor() {
   // .env + port
   const env = readEnv();
   const port = getPort();
-  fs.existsSync(ENV_PATH)
+  fs.existsSync(envFilePath())
     ? console.log(ok(`.env found (PORT=${port})`))
     : console.log(warn(`.env not found — using defaults (PORT=${port})`));
 
@@ -517,7 +606,8 @@ function cmdHelp(args) {
   const topic = args[0];
   const details = {
     chat:    'stoa chat [room_id]\n  Start the interactive terminal chat client (human mode).\n  Defaults to room 1. STOA_URL is derived from PORT in .env.',
-    install: 'stoa install\n  Bootstrap on a fresh machine: link the `stoa` command onto PATH + enable the gateway.\n  Run once as `node cli.js install` (the `stoa` command does not exist yet); afterwards use `stoa ...`.\n  Code stays in the repo; data lives in ~/.stoa/server. Then run "stoa dashboard".',
+    install: 'stoa install\n  Bootstrap on a fresh machine: link the `stoa` command onto PATH + enable the gateway.\n  Run once as `node cli.js install` (the `stoa` command does not exist yet); afterwards use `stoa ...`.\n  Creates .env + config.yaml, asks for your dashboard email/password, then opens the dashboard.\n  Code stays in the repo; data lives in ~/.stoa/server.',
+    setup:   'stoa setup\n  Create .env + config.yaml (from the *.example files) if missing, then set the\n  dashboard login (STOA_EMAIL / STOA_PASSWORD in .env). Re-run any time to change it;\n  restart the server to apply (stoa gateway restart).',
     uninstall: 'stoa uninstall [--yes]\n  Remove Stoa: stop & remove the gateway/agent services, unlink the `stoa` command,\n  and delete ~/.stoa. Offers to back up workspace + agent + data (tar.gz in your home) first.\n  Your cloned repo and node_modules are left untouched. --yes skips prompts.',
     link:    'stoa link\n  Make the `stoa` command available on PATH (npm link, or a symlink into ~/.local/bin).',
     dashboard: 'stoa dashboard\n  Open the web dashboard in your browser. Starts the gateway first if nothing is running.\n  Targets the installed server (~/.stoa, default :3030), else the dev server from .env.',
@@ -538,6 +628,7 @@ ${C.bold}Commands:${C.reset}
   ${C.cyan}dashboard${C.reset}          open the web dashboard (default when no command); starts the gateway if needed
   ${C.cyan}chat${C.reset} [room]        start the interactive terminal chat client
   ${C.cyan}install${C.reset}            bootstrap: link the \`stoa\` command + enable the gateway
+  ${C.cyan}setup${C.reset}              create .env + config.yaml and set the dashboard login
   ${C.cyan}uninstall${C.reset}          remove Stoa (offers to back up workspace + agent + data first)
   ${C.cyan}gateway${C.reset} <cmd>      run server as a background service (enable|disable|start|stop|restart|status|logs)
   ${C.cyan}doctor${C.reset}             diagnose the local setup
@@ -565,6 +656,7 @@ function cmdVersion() {
     case 'dashboard':            await cmdDashboard(); break;
     case 'chat':                       cmdChat(args); break;
     case 'install':              await cmdInstall(); break;
+    case 'setup':                await cmdSetup(); break;
     case 'uninstall':            await cmdUninstall(args); break;
     case 'link':                       linkCommand(); break;
     case 'gateway':              await cmdGateway(args); break;
