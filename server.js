@@ -4,6 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 const { WebSocketServer } = require('ws');
+const paths = require('./paths');
 const db = require('./db');
 const { ClaudeSession } = require('./claude-session');
 const fallbackSessions = new Map();
@@ -49,14 +50,19 @@ function saveSession(participantId, claudeSessionId, workdir) {
   ).run(participantId, rp?.room_id ?? null, claudeSessionId, workdir || null);
 }
 
-// Load .env if present
-const envPath = path.join(__dirname, '.env');
+// Load .env if present (secrets only: STOA_SECRET, STOA_PASSWORD, tokens, …)
+const envPath = paths.envFile();
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)=(.*)$/);
     if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
   }
 }
+
+// Non-secret settings live in config.yaml (see config.js). Seed it on first run.
+const config = require('./config');
+config.ensureFile();
+let cfg = config.load();
 
 // Initialize schema on startup
 try {
@@ -165,13 +171,20 @@ function parseCookies(cookieHeader) {
   return cookies;
 }
 
-// Seed default auth user
+// Seed / sync the auth user from .env (STOA_EMAIL / STOA_PASSWORD).
+// If neither is set, fall back to the historical default and leave any
+// existing user untouched. If either is set, .env is authoritative.
 {
-  const existing = db.prepare('SELECT id FROM auth_users LIMIT 1').get();
+  const email = process.env.STOA_EMAIL || 'stoa@stoa.com';
+  const password = process.env.STOA_PASSWORD || 'stoa2026!';
+  const envProvided = !!(process.env.STOA_EMAIL || process.env.STOA_PASSWORD);
+  const existing = db.prepare('SELECT id FROM auth_users ORDER BY id LIMIT 1').get();
   if (!existing) {
-    const hash = hashPassword('stoa2026!');
-    db.prepare('INSERT INTO auth_users (email, password_hash) VALUES (?,?)').run('stoa@stoa.com', hash);
-    console.log('[auth] Default user seeded: stoa@stoa.com');
+    db.prepare('INSERT INTO auth_users (email, password_hash) VALUES (?,?)').run(email, hashPassword(password));
+    console.log(`[auth] Default user seeded: ${email}`);
+  } else if (envProvided) {
+    db.prepare('UPDATE auth_users SET email=?, password_hash=? WHERE id=?').run(email, hashPassword(password), existing.id);
+    console.log(`[auth] Auth user synced from .env: ${email}`);
   }
 }
 
@@ -185,12 +198,12 @@ setInterval(() => {
   db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
 }
 
-const PORT = parseInt(process.env.PORT) || 3000;
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const PORT = cfg.port;
+const UPLOADS_DIR = paths.uploadsDir();
 
 // Sync HUMAN_NAME env → human actor on startup (default: "Human")
 {
-  const humanName = process.env.HUMAN_NAME || 'Human';
+  const humanName = cfg.human_name;
   const human = db.prepare(`SELECT id FROM actors WHERE type='human' LIMIT 1`).get();
   if (human) db.prepare('UPDATE actors SET name=? WHERE id=?').run(humanName, human.id);
 }
@@ -210,12 +223,12 @@ function clientFileHash(name) {
   if (!fs.existsSync(fp)) return null;
   return crypto.createHash('sha256').update(fs.readFileSync(fp)).digest('hex').slice(0, 12);
 }
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // ── Scheduled cleanup: delete uploaded files older than CLEANUP_MAX_AGE_HOURS (skip avatar/)
 {
-  const CLEANUP_HOUR = parseInt(process.env.CLEANUP_CRON_HOUR) || 10;
-  const CLEANUP_MAX_AGE = (parseInt(process.env.CLEANUP_MAX_AGE_HOURS) || 24) * 3600_000;
+  const CLEANUP_HOUR = cfg.cleanup.cron_hour;
+  const CLEANUP_MAX_AGE = cfg.cleanup.max_age_hours * 3600_000;
 
   const cleanupUploads = () => {
     const now = Date.now();
@@ -260,8 +273,8 @@ function setSetting(key, value) {
 }
 
 function getPublicUrl(fallbackHost) {
-  const dbVal = getSetting('public_url');
-  if (dbVal) return dbVal;
+  const cfgVal = cfg.public_url || getSetting('public_url'); // config.yaml first, legacy DB fallback
+  if (cfgVal) return cfgVal;
   const envVal = process.env.STOA_PUBLIC_URL;
   if (envVal) {
     try {
@@ -274,7 +287,7 @@ function getPublicUrl(fallbackHost) {
 }
 
 function writeEnv(key, value) {
-  const envFile = path.join(__dirname, '.env');
+  const envFile = paths.envFile();
   let content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
   const re = new RegExp(`^${key}=.*$`, 'm');
   if (re.test(content)) {
@@ -520,8 +533,8 @@ const server = http.createServer(async (req, res) => {
     const base64Data = data_url.slice(data_url.indexOf(',') + 1);
     const oldAvatar = db.prepare('SELECT avatar_url FROM actors WHERE id=?').get(id);
     if (oldAvatar?.avatar_url) {
-      const oldPath = path.join(__dirname, oldAvatar.avatar_url.replace(/^\//, ''));
-      if (oldPath.startsWith(path.join(__dirname, 'uploads')) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      const oldPath = path.join(UPLOADS_DIR, oldAvatar.avatar_url.replace(/^\/uploads\//, ''));
+      if (oldPath.startsWith(UPLOADS_DIR) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
     }
     const saved = `avatar-${id}-${Date.now()}.${ext}`;
     const avatarDir = path.join(UPLOADS_DIR, 'avatar');
@@ -538,8 +551,8 @@ const server = http.createServer(async (req, res) => {
     const id = parseInt(avatarDeleteMatch[1]);
     const actor = db.prepare('SELECT avatar_url FROM actors WHERE id=?').get(id);
     if (actor?.avatar_url) {
-      const oldPath = path.join(__dirname, actor.avatar_url.replace(/^\//, ''));
-      if (oldPath.startsWith(path.join(__dirname, 'uploads')) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      const oldPath = path.join(UPLOADS_DIR, actor.avatar_url.replace(/^\/uploads\//, ''));
+      if (oldPath.startsWith(UPLOADS_DIR) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
     }
     db.prepare('UPDATE actors SET avatar_url=NULL WHERE id=?').run(id);
     return json(res, { ok: true });
@@ -909,63 +922,64 @@ const server = http.createServer(async (req, res) => {
       human_id:    human?.id ?? null,
       port:        PORT,
       human_name_from_env: !!process.env.HUMAN_NAME,
-      max_ai_turns: parseInt(process.env.MAX_AI_TURNS) || 5,
-      max_concurrent: parseInt(process.env.MAX_CONCURRENT) || 1,
-      session_idle_ttl: parseInt(process.env.SESSION_IDLE_TTL) || 5,
-      auto_compact_threshold_kb: parseInt(process.env.AUTO_COMPACT_THRESHOLD_KB) || 500,
-      cleanup_cron_hour: parseInt(process.env.CLEANUP_CRON_HOUR) || 10,
-      cleanup_max_age_hours: parseInt(process.env.CLEANUP_MAX_AGE_HOURS) || 24,
+      max_ai_turns: cfg.max_ai_turns,
+      max_concurrent: cfg.max_concurrent,
+      session_idle_ttl: cfg.session_idle_ttl,
+      auto_compact_threshold_kb: cfg.auto_compact_threshold_kb,
+      cleanup_cron_hour: cfg.cleanup.cron_hour,
+      cleanup_max_age_hours: cfg.cleanup.max_age_hours,
     });
   }
 
   if (req.method === 'PATCH' && url.pathname === '/api/settings') {
     const body = parseJsonBody(await readBody(req));
     if (!body) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
-    if (body.public_url !== undefined) setSetting('public_url', body.public_url.trim());
+    const patch = {};
+    if (body.public_url !== undefined) patch.public_url = body.public_url.trim() || null;
     if (body.human_name !== undefined) {
       const name = body.human_name.trim() || 'Human';
-      writeEnv('HUMAN_NAME', name);
-      process.env.HUMAN_NAME = name;
+      patch.human_name = name;
       const human = db.prepare(`SELECT id FROM actors WHERE type='human' LIMIT 1`).get();
       if (human) db.prepare('UPDATE actors SET name=? WHERE id=?').run(name, human.id);
     }
     if (body.max_ai_turns !== undefined) {
       const val = parseInt(body.max_ai_turns);
-      if (val >= 1 && val <= 100) { writeEnv('MAX_AI_TURNS', String(val)); process.env.MAX_AI_TURNS = String(val); }
+      if (val >= 1 && val <= 100) patch.max_ai_turns = val;
     }
     if (body.max_concurrent !== undefined) {
       const val = parseInt(body.max_concurrent);
       if (val >= 1 && val <= 10) {
-        writeEnv('MAX_CONCURRENT', String(val)); process.env.MAX_CONCURRENT = String(val);
+        patch.max_concurrent = val;
         for (const [, agentWs] of agentClients) agentWs.send(JSON.stringify({ type: 'set_config', max_concurrent: val }));
       }
     }
     if (body.session_idle_ttl !== undefined) {
       const val = parseInt(body.session_idle_ttl);
       if (val >= 1 && val <= 60) {
-        writeEnv('SESSION_IDLE_TTL', String(val)); process.env.SESSION_IDLE_TTL = String(val);
+        patch.session_idle_ttl = val;
         for (const [, agentWs] of agentClients) agentWs.send(JSON.stringify({ type: 'set_config', session_idle_ttl: val }));
       }
     }
     if (body.auto_compact_threshold_kb !== undefined) {
       const val = parseInt(body.auto_compact_threshold_kb);
       if (val >= 100 && val <= 5000) {
-        writeEnv('AUTO_COMPACT_THRESHOLD_KB', String(val)); process.env.AUTO_COMPACT_THRESHOLD_KB = String(val);
+        patch.auto_compact_threshold_kb = val;
         for (const [, agentWs] of agentClients) agentWs.send(JSON.stringify({ type: 'set_config', auto_compact_threshold_kb: val }));
       }
     }
     if (body.cleanup_cron_hour !== undefined) {
       const val = parseInt(body.cleanup_cron_hour);
-      if (val >= 0 && val <= 23) { writeEnv('CLEANUP_CRON_HOUR', String(val)); process.env.CLEANUP_CRON_HOUR = String(val); }
+      if (val >= 0 && val <= 23) patch.cleanup = { ...(patch.cleanup || {}), cron_hour: val };
     }
     if (body.cleanup_max_age_hours !== undefined) {
       const val = parseInt(body.cleanup_max_age_hours);
-      if (val >= 1 && val <= 720) { writeEnv('CLEANUP_MAX_AGE_HOURS', String(val)); process.env.CLEANUP_MAX_AGE_HOURS = String(val); }
+      if (val >= 1 && val <= 720) patch.cleanup = { ...(patch.cleanup || {}), max_age_hours: val };
     }
+    if (Object.keys(patch).length) cfg = config.update(patch);
     if (body.port !== undefined) {
       const newPort = parseInt(body.port);
       if (newPort && newPort !== PORT && newPort >= 1 && newPort <= 65535) {
-        writeEnv('PORT', String(newPort));
+        cfg = config.update({ port: newPort });
         const host = req.headers.host || `localhost:${PORT}`;
         const pubUrl = getPublicUrl(host);
         const newPubUrl = pubUrl.replace(`:${PORT}`, `:${newPort}`);
@@ -1005,8 +1019,7 @@ const server = http.createServer(async (req, res) => {
     }
     const actor = db.prepare('SELECT type FROM actors WHERE id=?').get(id);
     if (actor?.type === 'human') {
-      writeEnv('HUMAN_NAME', name.trim());
-      process.env.HUMAN_NAME = name.trim();
+      cfg = config.update({ human_name: name.trim() });
     }
     return json(res, { id, name: name.trim() });
   }
@@ -1015,8 +1028,8 @@ const server = http.createServer(async (req, res) => {
     const id = parseInt(url.pathname.split('/')[3]);
     const actor = db.prepare('SELECT avatar_url FROM actors WHERE id=?').get(id);
     if (actor?.avatar_url) {
-      const avatarPath = path.join(__dirname, actor.avatar_url.replace(/^\//, ''));
-      if (avatarPath.startsWith(path.join(__dirname, 'uploads')) && fs.existsSync(avatarPath)) fs.unlinkSync(avatarPath);
+      const avatarPath = path.join(UPLOADS_DIR, actor.avatar_url.replace(/^\/uploads\//, ''));
+      if (avatarPath.startsWith(UPLOADS_DIR) && fs.existsSync(avatarPath)) fs.unlinkSync(avatarPath);
     }
     const actorParts = db.prepare('SELECT id, room_id FROM room_participants WHERE actor_id=?').all(id);
     const affectedRooms = actorParts.map(r => r.room_id);
@@ -1130,11 +1143,10 @@ const server = http.createServer(async (req, res) => {
       : isOllama
         ? '# no CLI trust step needed for Ollama'
         : 'claude --version > /dev/null 2>&1 || true';
-    const backendEnv = isGemini
-      ? `\n      STOA_AI_BACKEND: 'gemini',`
-      : isOllama
-        ? `\n      STOA_AI_BACKEND: 'ollama',`
-        : '';
+    const backendName = isGemini ? 'gemini' : isOllama ? 'ollama' : '';
+    const backendPlistEnv = backendName ? `\n    <key>STOA_AI_BACKEND</key><string>${backendName}</string>` : '';
+    const backendUnitEnv  = backendName ? `\nEnvironment=STOA_AI_BACKEND=${backendName}` : '';
+    const backendShellEnv = backendName ? `STOA_AI_BACKEND=${backendName} ` : '';
 
     const script = `#!/bin/bash
 set -e
@@ -1142,14 +1154,27 @@ set -e
 BASE_URL="${baseUrl}"
 STOA_URL="${stoaUrl}"
 REG_TOKEN="${token}"
-AGENT_DIR="\${HOME}/stoa-agent"
+AGENT_DIR="\${HOME}/.stoa/agent"
+WORK_DIR="\${HOME}/.stoa/workspace"
 
 echo "=== Stoa Agent Setup (${isGemini ? 'Gemini' : isOllama ? 'Ollama' : 'Claude'}) ==="
 echo "Server : \${BASE_URL}"
 echo ""
 
+# Migrate legacy locations (~/stoa-agent, ~/stoa-workspace) into ~/.stoa/
+if [ -d "\${HOME}/stoa-agent" ] && [ ! -d "\${AGENT_DIR}" ]; then
+  mkdir -p "\${HOME}/.stoa"
+  mv "\${HOME}/stoa-agent" "\${AGENT_DIR}"
+  echo "  migrated ~/stoa-agent -> ~/.stoa/agent"
+fi
+if [ -d "\${HOME}/stoa-workspace" ] && [ ! -d "\${WORK_DIR}" ]; then
+  mkdir -p "\${HOME}/.stoa"
+  mv "\${HOME}/stoa-workspace" "\${WORK_DIR}"
+  echo "  migrated ~/stoa-workspace -> ~/.stoa/workspace"
+fi
+
 mkdir -p "\${AGENT_DIR}"
-mkdir -p "\${HOME}/stoa-workspace"
+mkdir -p "\${WORK_DIR}"
 
 echo "[1/5] Downloading client files..."
 cd "\${AGENT_DIR}"
@@ -1177,46 +1202,95 @@ fi
 echo "  ok Actor #\${ACTOR_ID} (\${AGENT_NAME})"
 
 echo "[4/5] Approving workspace trust..."
-cd "\${HOME}/stoa-workspace"
+cd "\${WORK_DIR}"
 ${trustCmd}
 cd "\${AGENT_DIR}"
 
-echo "[5/5] Setting up PM2..."
-if ! command -v pm2 &> /dev/null; then
-  sudo npm install -g pm2 > /dev/null 2>&1 || npm install -g pm2 > /dev/null 2>&1
+echo "[5/5] Installing background service..."
+NODE_BIN="\$(command -v node)"
+LOG_DIR="\${HOME}/.stoa/logs"
+mkdir -p "\${LOG_DIR}"
+LOG_FILE="\${LOG_DIR}/agent-\${ACTOR_ID}.log"
+OS="\$(uname -s)"
+
+if [ "\${OS}" = "Darwin" ]; then
+  LABEL="com.stoa.agent.\${ACTOR_ID}"
+  PLIST="\${HOME}/Library/LaunchAgents/\${LABEL}.plist"
+  mkdir -p "\${HOME}/Library/LaunchAgents"
+  cat > "\${PLIST}" << EOFPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>\${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>\${NODE_BIN}</string>
+    <string>\${AGENT_DIR}/stoa.js</string>
+  </array>
+  <key>WorkingDirectory</key><string>\${AGENT_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STOA_URL</key><string>\${STOA_URL}</string>
+    <key>STOA_TYPE</key><string>ai</string>
+    <key>STOA_ACTOR_ID</key><string>\${ACTOR_ID}</string>
+    <key>STOA_SECRET</key><string>\${STOA_SECRET}</string>
+    <key>STOA_WORK_DIR</key><string>\${WORK_DIR}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>${backendPlistEnv}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>\${LOG_FILE}</string>
+  <key>StandardErrorPath</key><string>\${LOG_FILE}</string>
+</dict>
+</plist>
+EOFPLIST
+  launchctl unload "\${PLIST}" 2>/dev/null || true
+  launchctl load -w "\${PLIST}"
+  SVC_STATUS="launchctl list | grep \${LABEL}"
+  SVC_LOGS="tail -f \${LOG_FILE}"
+elif command -v systemctl >/dev/null 2>&1; then
+  UNIT="stoa-agent-\${ACTOR_ID}"
+  UNIT_DIR="\${HOME}/.config/systemd/user"
+  mkdir -p "\${UNIT_DIR}"
+  cat > "\${UNIT_DIR}/\${UNIT}.service" << EOFUNIT
+[Unit]
+Description=Stoa agent \${AGENT_NAME}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=\${AGENT_DIR}
+Environment=STOA_URL=\${STOA_URL}
+Environment=STOA_TYPE=ai
+Environment=STOA_ACTOR_ID=\${ACTOR_ID}
+Environment=STOA_SECRET=\${STOA_SECRET}
+Environment=STOA_WORK_DIR=\${WORK_DIR}${backendUnitEnv}
+ExecStart=\${NODE_BIN} \${AGENT_DIR}/stoa.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOFUNIT
+  loginctl enable-linger "\$(whoami)" 2>/dev/null || sudo loginctl enable-linger "\$(whoami)" 2>/dev/null || true
+  systemctl --user daemon-reload
+  systemctl --user enable --now "\${UNIT}"
+  SVC_STATUS="systemctl --user status \${UNIT}"
+  SVC_LOGS="journalctl --user -u \${UNIT} -f"
+else
+  echo "  no launchd/systemd — starting detached (no autostart on boot)"
+  STOA_URL="\${STOA_URL}" STOA_TYPE=ai STOA_ACTOR_ID="\${ACTOR_ID}" STOA_SECRET="\${STOA_SECRET}" STOA_WORK_DIR="\${WORK_DIR}" ${backendShellEnv}nohup "\${NODE_BIN}" "\${AGENT_DIR}/stoa.js" > "\${LOG_FILE}" 2>&1 &
+  disown 2>/dev/null || true
+  SVC_STATUS="pgrep -fl stoa.js"
+  SVC_LOGS="tail -f \${LOG_FILE}"
 fi
-
-cat > ecosystem.config.js << EOFCFG
-module.exports = {
-  apps: [{
-    name: '\${AGENT_NAME}',
-    script: 'stoa.js',
-    cwd: process.env.HOME + '/stoa-agent',
-    env: {
-      STOA_URL: '\${STOA_URL}',
-      STOA_TYPE: 'ai',
-      STOA_ACTOR_ID: '\${ACTOR_ID}',
-      STOA_SECRET: '\${STOA_SECRET}',
-      STOA_WORK_DIR: process.env.HOME + '/stoa-workspace',${backendEnv}
-    },
-    restart_delay: 3000,
-    max_restarts: 50,
-    autorestart: true,
-  }]
-};
-EOFCFG
-
-pm2 stop "\${AGENT_NAME}" 2>/dev/null || true
-pm2 delete "\${AGENT_NAME}" 2>/dev/null || true
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup 2>/dev/null | grep -E "sudo|^[A-Z]" | head -1 | bash 2>/dev/null || true
 
 echo ""
 echo "=== Done ==="
 echo "Actor  : #\${ACTOR_ID} (\${AGENT_NAME})"
-echo "Status : pm2 status"
-echo "Logs   : pm2 logs \${AGENT_NAME}"
+echo "Status : \${SVC_STATUS}"
+echo "Logs   : \${SVC_LOGS}"
 `;
 
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -1247,22 +1321,34 @@ echo "Logs   : pm2 logs \${AGENT_NAME}"
       : ps1IsOllama
         ? '# no CLI trust step needed for Ollama'
         : 'try { & claude --version 2>$null } catch {}';
-    const ps1BackendEnv = ps1IsGemini
-      ? `\n      STOA_AI_BACKEND: 'gemini',`
-      : ps1IsOllama
-        ? `\n      STOA_AI_BACKEND: 'ollama',`
-        : '';
+    const ps1BackendName = ps1IsGemini ? 'gemini' : ps1IsOllama ? 'ollama' : '';
+    const ps1BackendLine = ps1BackendName ? `,\n  '$env:STOA_AI_BACKEND = "${ps1BackendName}"'` : '';
 
     const script = `$ErrorActionPreference = "Stop"
 $BaseUrl = "${baseUrl}"
 $StoaUrl = "${stoaUrl}"
 $RegToken = "${token}"
-$AgentDir = "$env:USERPROFILE\\stoa-agent"
-$WorkDir  = "$env:USERPROFILE\\stoa-workspace"
+$StoaRoot = "$env:USERPROFILE\\.stoa"
+$AgentDir = "$StoaRoot\\agent"
+$WorkDir  = "$StoaRoot\\workspace"
+$LegacyAgent = "$env:USERPROFILE\\stoa-agent"
+$LegacyWork  = "$env:USERPROFILE\\stoa-workspace"
 
 Write-Host "=== Stoa Agent Setup (${ps1IsGemini ? 'Gemini' : ps1IsOllama ? 'Ollama' : 'Claude'}) ==="
 Write-Host "Server : $BaseUrl"
 Write-Host ""
+
+# Migrate legacy locations (~/stoa-agent, ~/stoa-workspace) into ~/.stoa/
+if ((Test-Path $LegacyAgent) -and -not (Test-Path $AgentDir)) {
+  New-Item -ItemType Directory -Force $StoaRoot | Out-Null
+  Move-Item $LegacyAgent $AgentDir
+  Write-Host "  migrated stoa-agent -> .stoa\\agent"
+}
+if ((Test-Path $LegacyWork) -and -not (Test-Path $WorkDir)) {
+  New-Item -ItemType Directory -Force $StoaRoot | Out-Null
+  Move-Item $LegacyWork $WorkDir
+  Write-Host "  migrated stoa-workspace -> .stoa\\workspace"
+}
 
 New-Item -ItemType Directory -Force $AgentDir | Out-Null
 New-Item -ItemType Directory -Force $WorkDir  | Out-Null
@@ -1293,39 +1379,35 @@ Set-Location $WorkDir
 ${ps1TrustCmd}
 Set-Location $AgentDir
 
-Write-Host "[5/5] Setting up PM2..."
-if (-not (Get-Command pm2 -ErrorAction SilentlyContinue)) { npm install -g pm2 }
+Write-Host "[5/5] Installing background service..."
+$NodeExe = (Get-Command node).Source
+$LogDir = "$StoaRoot\\logs"
+New-Item -ItemType Directory -Force $LogDir | Out-Null
+$LogFile = "$LogDir\\agent-$ActorId.log"
+$Launcher = "$AgentDir\\start-agent.ps1"
 
-@"
-module.exports = {
-  apps: [{
-    name: '$AgentName',
-    script: 'stoa.js',
-    cwd: require('os').homedir() + '/stoa-agent',
-    env: {
-      STOA_URL: '$StoaUrl',
-      STOA_TYPE: 'ai',
-      STOA_ACTOR_ID: String($ActorId),
-      STOA_SECRET: '$Secret',
-      STOA_WORK_DIR: require('os').homedir() + '/stoa-workspace',${ps1BackendEnv}
-    },
-    restart_delay: 3000,
-    max_restarts: 50,
-    autorestart: true,
-  }]
-};
-"@ | Out-File -Encoding utf8 "$AgentDir\\ecosystem.config.js"
+@(
+  '$env:STOA_URL = "' + $StoaUrl + '"',
+  '$env:STOA_TYPE = "ai"',
+  '$env:STOA_ACTOR_ID = "' + $ActorId + '"',
+  '$env:STOA_SECRET = "' + $Secret + '"',
+  '$env:STOA_WORK_DIR = "' + $WorkDir + '"'${ps1BackendLine},
+  'Set-Location "' + $AgentDir + '"',
+  '& "' + $NodeExe + '" stoa.js *>> "' + $LogFile + '"'
+) | Out-File -Encoding utf8 $Launcher
 
-try { pm2 stop $AgentName 2>$null } catch {}
-try { pm2 delete $AgentName 2>$null } catch {}
-pm2 start "$AgentDir\\ecosystem.config.js"
-pm2 save
+$TaskName = "StoaAgent$ActorId"
+$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $Launcher + '"')
+$Trigger = New-ScheduledTaskTrigger -AtLogOn
+$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Force | Out-Null
+Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ""
 Write-Host "=== Done ==="
 Write-Host "Actor  : #$ActorId ($AgentName)"
-Write-Host "Status : pm2 status"
-Write-Host "Logs   : pm2 logs $AgentName"
+Write-Host "Status : Get-ScheduledTask -TaskName $TaskName"
+Write-Host "Logs   : $LogFile"
 `;
 
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -1916,7 +1998,7 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'force_update' }));
       }
       ws.send(JSON.stringify({ type: 'agent_ready' }));
-      ws.send(JSON.stringify({ type: 'set_config', max_concurrent: parseInt(process.env.MAX_CONCURRENT) || 1, session_idle_ttl: parseInt(process.env.SESSION_IDLE_TTL) || 5, auto_compact_threshold_kb: parseInt(process.env.AUTO_COMPACT_THRESHOLD_KB) || 500 }));
+      ws.send(JSON.stringify({ type: 'set_config', max_concurrent: cfg.max_concurrent, session_idle_ttl: cfg.session_idle_ttl, auto_compact_threshold_kb: cfg.auto_compact_threshold_kb }));
       const connectedActor = db.prepare('SELECT id, name, type, adapter, adapter_config, avatar_color, avatar_symbol, avatar_url, created_at FROM actors WHERE id=?').get(agentActorId);
       if (connectedActor) broadcastGlobal({ type: 'actor_status', actor: { ...connectedActor, online: true, client_version: msg.client_version || null } });
     }
@@ -2647,7 +2729,7 @@ function resolveAgentOrder(content, agents) {
 const activeSequences = new Map(); // roomId → { cancelled: bool }
 
 async function triggerAgentsSequential(roomId, agents, content, replyTo, attachments) {
-  const maxTurns = parseInt(process.env.MAX_AI_TURNS || '5');
+  const maxTurns = cfg.max_ai_turns;
   const seq = { cancelled: false };
   activeSequences.set(roomId, seq);
   let turnCount = 0;
@@ -3209,7 +3291,7 @@ function parseJsonBody(raw) {
 // ─── Idle session cleanup ─────────────────────────────────────────────────────
 
 setInterval(() => {
-  const timeout = parseInt(getSetting('idle_timeout_seconds') ?? '300');
+  const timeout = cfg.idle_timeout_seconds;
   db.prepare(
     "UPDATE ai_sessions SET status='idle' WHERE status='active' AND last_active_at < datetime('now', '-' || ? || ' seconds')"
   ).run(timeout);
