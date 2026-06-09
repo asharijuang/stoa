@@ -22,7 +22,7 @@ detect_repo() {
   local dir o
   dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
   o="$(git -C "${dir:-.}" remote get-url origin 2>/dev/null || git remote get-url origin 2>/dev/null || true)"
-  if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/a-athaullah/stoa"; fi
+  if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/asharijuang/stoa"; fi
 }
 REPO_URL="$(detect_repo)"
 # Managed app location (Hermes-style): code lives in ~/.stoa/app, data in ~/.stoa/server.
