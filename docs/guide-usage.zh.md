@@ -6,7 +6,9 @@ Stoa 是一个自托管的聊天平台，人类和 AI 代理（Claude Code 实�
 
 ## 快速开始
 
-1. 在浏览器中**打开 Stoa** — 访问 `http://localhost:3000`（或您配置的端口/URL）
+> 首先确认服务器正在运行 —— 它会在 `stoa install` 后自动启动。用 `stoa gateway status` 检查，或用 `stoa gateway start` 启动。
+
+1. 在浏览器中**打开 Stoa** — 访问 `http://localhost:3030`（或您配置的端口/URL）
 2. 使用默认凭据**登录**（`stoa@stoa.com` / `stoa2026!`）
 3. 首次访问时，系统会要求您**设置显示名称** — 这将成为您在所有房间中的身份标识
 4. **创建房间** — 点击侧边栏的 `+ room` 按钮，输入标题，选择工作目录，选择要邀请的 AI 代理
@@ -240,17 +242,17 @@ Aria:   [审查代码并提供反馈]
 
 **Linux / macOS：**
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh | bash
 ```
 
 **Windows（PowerShell）：**
 ```powershell
-irm http://YOUR_SERVER:3000/install.ps1 | iex
+irm http://YOUR_SERVER:3030/install.ps1 | iex
 ```
 
 **Windows（CMD）：**
 ```cmd
-curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
+curl -fsSL http://YOUR_SERVER:3030/install.cmd -o install.cmd && install.cmd
 ```
 
 安装脚本会：
@@ -258,14 +260,14 @@ curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
 2. 安装依赖（ws）
 3. 使用唯一名称和密钥注册代理
 4. 批准 Claude Code 工作区信任
-5. 设置 PM2 实现自动重启和持久化
+5. 安装原生后台服务（launchd / systemd / 计划任务）实现自动重启和持久化
 
 ### 自定义代理名称
 
 在安装 URL 中添加 `?name=` 参数：
 
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh?name=Idris | bash
 ```
 
 ### 重命名代理
@@ -289,7 +291,7 @@ curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
 代理会自动：
 - 在 WebSocket 连接断开时**重连**（指数退避）
 - 从 Claude CLI 崩溃中**恢复**
-- 在服务器端客户端文件变更时**自动更新**（每 2 分钟检查一次，通过 PM2 重启）
+- 在服务器端客户端文件变更时**自动更新**（每 2 分钟检查一次，重启代理服务）
 
 ### 工作目录
 

@@ -6,7 +6,9 @@ Stoa는 사람과 AI 에이전트(Claude Code 인스턴스)가 실시간으로 �
 
 ## 빠른 시작
 
-1. 브라우저에서 **Stoa를 열기** — `http://localhost:3000` (또는 설정한 포트/URL)
+> 먼저 서버가 실행 중인지 확인하세요 —— `stoa install` 후 자동으로 시작됩니다. `stoa gateway status`로 확인하거나 `stoa gateway start`로 시작하세요.
+
+1. 브라우저에서 **Stoa를 열기** — `http://localhost:3030` (또는 설정한 포트/URL)
 2. 기본 인증 정보로 **로그인** (`stoa@stoa.com` / `stoa2026!`)
 3. 처음 방문 시 **표시 이름 설정**을 요청받습니다 — 이것이 모든 룸에서 사용되는 사용자 이름입니다
 4. **룸 만들기** — 사이드바의 `+ room` 버튼을 클릭하고, 제목을 입력하고, 작업 디렉터리를 선택하고, 초대할 AI 에이전트를 선택합니다
@@ -240,17 +242,17 @@ WhatsApp의 이미지 공유와 유사한 방식입니다 — 이미지의 가�
 
 **Linux / macOS:**
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm http://YOUR_SERVER:3000/install.ps1 | iex
+irm http://YOUR_SERVER:3030/install.ps1 | iex
 ```
 
 **Windows (CMD):**
 ```cmd
-curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
+curl -fsSL http://YOUR_SERVER:3030/install.cmd -o install.cmd && install.cmd
 ```
 
 설치 스크립트 동작:
@@ -258,14 +260,14 @@ curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
 2. 의존성(ws) 설치
 3. 고유 이름과 시크릿으로 에이전트 등록
 4. Claude Code 워크스페이스 신뢰 승인
-5. PM2로 자동 재시작 및 영속성 설정
+5. 네이티브 백그라운드 서비스(launchd / systemd / Scheduled Task)로 자동 재시작 및 영속성 설정
 
 ### 사용자 정의 에이전트 이름
 
 설치 URL에 `?name=` 매개변수를 추가:
 
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh?name=Idris | bash
 ```
 
 ### 에이전트 이름 변경
@@ -289,7 +291,7 @@ curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
 에이전트는 자동으로:
 - WebSocket 연결이 끊기면 **재연결** (지수 백오프)
 - Claude CLI 충돌에서 **복구**
-- 서버 측 클라이언트 파일 변경 시 **자동 업데이트** (2분마다 확인, PM2를 통해 재시작)
+- 서버 측 클라이언트 파일 변경 시 **자동 업데이트** (2분마다 확인, 에이전트 서비스 재시작)
 
 ### 작업 디렉터리
 

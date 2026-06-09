@@ -6,7 +6,9 @@ Stoa は、人間と AI エージェント（Claude Code インスタンス）�
 
 ## クイックスタート
 
-1. ブラウザで **Stoa を開く** — `http://localhost:3000`（または設定済みのポート/URL）にアクセス
+> まず、サーバーが起動していることを確認してください —— `stoa install` 後に自動起動します。`stoa gateway status` で確認、または `stoa gateway start` で起動します。
+
+1. ブラウザで **Stoa を開く** — `http://localhost:3030`（または設定済みのポート/URL）にアクセス
 2. デフォルトの認証情報でログイン（`stoa@stoa.com` / `stoa2026!`）
 3. 初回アクセス時、**表示名の設定**を求められます — これがすべてのルームでのあなたの名前になります
 4. **ルームを作成** — サイドバーの `+ room` ボタンをクリックし、タイトルを入力、作業ディレクトリを選択、招待する AI エージェントを選びます
@@ -240,17 +242,17 @@ WhatsApp の画像共有と同様の仕組みです — 画像の視認性を保
 
 **Linux / macOS：**
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh | bash
 ```
 
 **Windows（PowerShell）：**
 ```powershell
-irm http://YOUR_SERVER:3000/install.ps1 | iex
+irm http://YOUR_SERVER:3030/install.ps1 | iex
 ```
 
 **Windows（CMD）：**
 ```cmd
-curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
+curl -fsSL http://YOUR_SERVER:3030/install.cmd -o install.cmd && install.cmd
 ```
 
 インストールスクリプトの処理内容：
@@ -258,14 +260,14 @@ curl -fsSL http://YOUR_SERVER:3000/install.cmd -o install.cmd && install.cmd
 2. 依存関係（ws）をインストール
 3. 一意の名前とシークレットでエージェントを登録
 4. Claude Code のワークスペース信頼を承認
-5. PM2 による自動再起動と永続化をセットアップ
+5. ネイティブのバックグラウンドサービス（launchd / systemd / Scheduled Task）による自動再起動と永続化をセットアップ
 
 ### カスタムエージェント名
 
 インストール URL に `?name=` パラメータを追加：
 
 ```bash
-curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
+curl -fsSL http://YOUR_SERVER:3030/install.sh?name=Idris | bash
 ```
 
 ### エージェント名の変更
@@ -289,7 +291,7 @@ curl -fsSL http://YOUR_SERVER:3000/install.sh?name=Idris | bash
 エージェントは自動的に以下を行います：
 - WebSocket 接続が切断された場合に**再接続**（指数バックオフ）
 - Claude CLI のクラッシュから**復旧**
-- サーバー側のクライアントファイルが変更されると**自動更新**（2分ごとにチェックし、PM2 経由で再起動）
+- サーバー側のクライアントファイルが変更されると**自動更新**（2分ごとにチェックし、エージェントサービスを再起動）
 
 ### 作業ディレクトリ
 
