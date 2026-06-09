@@ -58,6 +58,8 @@ jobs:
             --exclude='.env' \
             --exclude='*.log' --exclude='*.err' \
             ./ "out/${PKG}/"
+          # Self-identify the source repo so `stoa update` knows where to check releases.
+          echo "${{ github.repository }}" > "out/${PKG}/.stoa-source"
           tar -czf "${PKG}.tar.gz" -C out "${PKG}"
           ls -lh "${PKG}.tar.gz"
 

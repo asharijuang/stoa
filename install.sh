@@ -25,7 +25,9 @@ detect_repo() {
   if [ -n "$o" ]; then echo "$o"; else echo "https://github.com/a-athaullah/stoa"; fi
 }
 REPO_URL="$(detect_repo)"
-INSTALL_DIR="${STOA_DIR:-$HOME/stoa}"
+# Managed app location (Hermes-style): code lives in ~/.stoa/app, data in ~/.stoa/server.
+INSTALL_DIR="${STOA_DIR:-$HOME/.stoa/app}"
+REPO_SLUG="$(echo "$REPO_URL" | sed -E 's#.*github\.com[:/]+##; s#\.git$##')"
 
 # ── Detect OS ──────────────────────────────────────────────────────────────────
 case "$(uname -s)" in
@@ -75,6 +77,9 @@ else
   git clone "${REPO_URL}" "${INSTALL_DIR}"
   cd "${INSTALL_DIR}"
 fi
+
+# Record the source repo so `stoa update` knows which GitHub releases to check.
+[ -n "${REPO_SLUG}" ] && echo "${REPO_SLUG}" > "${INSTALL_DIR}/.stoa-source" 2>/dev/null || true
 
 # ── Install dependencies ──────────────────────────────────────────────────────────
 echo "[2/3] Installing dependencies (npm install)…"

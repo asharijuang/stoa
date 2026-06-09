@@ -20,7 +20,9 @@ function Get-RepoUrl {
   if ($o) { return $o } else { return "https://github.com/a-athaullah/stoa" }
 }
 $RepoUrl    = Get-RepoUrl
-$InstallDir = if ($env:STOA_DIR) { $env:STOA_DIR } else { "$env:USERPROFILE\stoa" }
+# Managed app location (Hermes-style): code in ~/.stoa/app, data in ~/.stoa/server.
+$InstallDir = if ($env:STOA_DIR) { $env:STOA_DIR } else { "$env:USERPROFILE\.stoa\app" }
+$RepoSlug   = ($RepoUrl -replace '.*github\.com[:/]+', '') -replace '\.git$', ''
 
 Write-Host "=== Stoa installer (Windows) ==="
 
@@ -46,6 +48,9 @@ if ((Test-Path ".\cli.js") -and (Test-Path ".\server.js")) {
   git clone $RepoUrl $InstallDir
   Set-Location $InstallDir
 }
+
+# Record the source repo so `stoa update` knows which GitHub releases to check.
+if ($RepoSlug) { Set-Content -Path "$InstallDir\.stoa-source" -Value $RepoSlug -NoNewline }
 
 Write-Host "[2/3] Installing dependencies (npm install)..."
 npm install --no-audit --no-fund
