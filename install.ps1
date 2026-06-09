@@ -36,24 +36,36 @@ $nodeMajor = [int](node -p "process.versions.node.split('.')[0]")
 if ($nodeMajor -lt 20) { Write-Error "Node 20+ required (found $(node -v))."; exit 1 }
 Write-Host "ok: node $(node -v), npm $(npm -v), git present"
 
+# Priority: current checkout (dev) → prebuilt GitHub release tarball (no build!) → git clone.
 if ((Test-Path ".\cli.js") -and (Test-Path ".\server.js")) {
   $InstallDir = (Get-Location).Path
   Write-Host "[1/3] Using current checkout: $InstallDir"
 } elseif (Test-Path "$InstallDir\.git") {
   Write-Host "[1/3] Updating existing clone: $InstallDir"
   git -C "$InstallDir" pull --ff-only
-  Set-Location $InstallDir
 } else {
-  Write-Host "[1/3] Cloning $RepoUrl -> $InstallDir"
-  git clone $RepoUrl $InstallDir
-  Set-Location $InstallDir
+  $asset = $null
+  try {
+    $rel = Invoke-RestMethod "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers @{ 'User-Agent' = 'stoa-cli' }
+    $asset = ($rel.assets | Where-Object { $_.name -like '*.tar.gz' } | Select-Object -First 1).browser_download_url
+  } catch {}
+  if ($asset) {
+    Write-Host "[1/3] Installing from latest release - prebuilt, no build"
+    New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    $tmp = Join-Path $env:TEMP 'stoa-release.tar.gz'
+    Invoke-WebRequest $asset -OutFile $tmp -UseBasicParsing
+    tar -xzf $tmp -C $InstallDir --strip-components=1
+    Remove-Item $tmp -Force
+  } else {
+    Write-Host "[1/3] No release found - cloning $RepoUrl"
+    git clone $RepoUrl $InstallDir
+  }
+  if ($RepoSlug) { Set-Content -Path "$InstallDir\.stoa-source" -Value $RepoSlug -NoNewline }
 }
+Set-Location $InstallDir
 
-# Record the source repo so `stoa update` knows which GitHub releases to check.
-if ($RepoSlug) { Set-Content -Path "$InstallDir\.stoa-source" -Value $RepoSlug -NoNewline }
-
-Write-Host "[2/3] Installing dependencies (npm install)..."
-npm install --no-audit --no-fund
+Write-Host "[2/3] Installing dependencies..."
+npm install --omit=dev --no-audit --no-fund
 
 Write-Host "[3/3] Bootstrapping (link command + enable gateway)..."
 node cli.js install
