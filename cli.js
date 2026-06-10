@@ -6,6 +6,8 @@
 //   stoa chat [room]    start the interactive terminal chat client
 //   stoa install        bootstrap: link the `stoa` command + enable the gateway (run as `node cli.js install`)
 //   stoa uninstall      remove Stoa (service + command + ~/.stoa), with optional backup
+//   stoa export [file]  back up server data (DB + uploads + config) to a .tar.gz
+//   stoa import <file>  restore a backup archive (overwrites current data)
 //   stoa gateway <cmd>  run server as a background service (enable|disable|start|stop|restart|status|logs)
 //   stoa doctor         diagnose the local setup
 //   stoa update         pull latest code, install deps, restart gateway
@@ -335,6 +337,148 @@ async function cmdUninstall(args) {
   console.log(`${C.gray}Reinstall any time with: node cli.js install${C.reset}`);
 }
 
+// ─── export / import: portable backup & restore of the server's data ────────────
+// Logical archive name → resolved absolute path on this machine. The archive uses a
+// flat, normalized layout (stoa.db, config.yaml, uploads/, .env) so it restores
+// correctly whether this machine is a dev checkout or an installed (~/.stoa/server)
+// layout — paths.* maps each name to the right place on either side.
+function dataMap() {
+  return {
+    'stoa.db':     paths.dbPath(),
+    'config.yaml': path.join(paths.serverDir(), 'config.yaml'),
+    '.env':        paths.envFile(),
+    'uploads':     paths.uploadsDir(),   // directory
+  };
+}
+
+function tsStamp() { return new Date().toISOString().replace(/[:T]/g, '-').replace(/\..+/, ''); }
+
+// Copy the current server data into `stage` using the normalized layout.
+// Returns the list of items actually staged. `.env` is staged only when withSecrets.
+async function stageData(stage, { withSecrets }) {
+  const map = dataMap();
+  fs.mkdirSync(stage, { recursive: true });
+  const included = [];
+
+  // DB: SQLite online backup → a consistent snapshot even while the server runs.
+  if (fs.existsSync(map['stoa.db'])) {
+    try {
+      const Database = require('better-sqlite3');
+      const src = new Database(map['stoa.db'], { readonly: true });
+      await src.backup(path.join(stage, 'stoa.db'));
+      src.close();
+    } catch (e) {
+      fs.copyFileSync(map['stoa.db'], path.join(stage, 'stoa.db'));
+      console.log(warn(`db online-backup unavailable (${e.message.split('\n')[0]}); used a raw file copy`));
+    }
+    included.push('stoa.db');
+  }
+  if (fs.existsSync(map['config.yaml'])) { fs.copyFileSync(map['config.yaml'], path.join(stage, 'config.yaml')); included.push('config.yaml'); }
+  if (fs.existsSync(map['uploads']))     { fs.cpSync(map['uploads'], path.join(stage, 'uploads'), { recursive: true }); included.push('uploads/'); }
+  if (withSecrets && fs.existsSync(map['.env'])) { fs.copyFileSync(map['.env'], path.join(stage, '.env')); included.push('.env'); }
+  return included;
+}
+
+async function cmdExport(args) {
+  const withSecrets = args.includes('--with-secrets');
+  const outArg = args.find(a => !a.startsWith('-'));
+  const stamp = tsStamp();
+  const out = path.resolve(outArg || path.join(os.homedir(), `stoa-export-${stamp}.tar.gz`));
+  const stage = path.join(os.tmpdir(), `stoa-export-${stamp}`);
+  fs.rmSync(stage, { recursive: true, force: true });
+
+  console.log(`${C.bold}Exporting Stoa data${C.reset} ${C.gray}(${paths.mode()} mode, ${paths.serverDir().replace(os.homedir(), '~')})${C.reset}`);
+  const included = await stageData(stage, { withSecrets });
+  if (!included.length) { console.log(bad('nothing to export — no DB/uploads/config found.')); fs.rmSync(stage, { recursive: true, force: true }); process.exitCode = 1; return; }
+
+  fs.writeFileSync(path.join(stage, 'MANIFEST.json'), JSON.stringify({
+    tool: 'stoa', kind: 'export', version: pkg().version || null,
+    created_at: new Date().toISOString(), mode: paths.mode(),
+    includes: included, secrets: included.includes('.env'),
+  }, null, 2));
+
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  const r = spawnSync('tar', ['-czf', out, '-C', stage, '.'], { stdio: 'ignore' });
+  fs.rmSync(stage, { recursive: true, force: true });
+  if (r.status !== 0) { console.log(bad('tar failed — export aborted.')); process.exitCode = 1; return; }
+  try { fs.chmodSync(out, 0o600); } catch {}
+
+  console.log(ok(`exported ${included.join(', ')} → ${out.replace(os.homedir(), '~')}`));
+  if (!withSecrets) console.log(`${C.gray}(.env not included — add it with --with-secrets, or set the login after import with 'stoa setup')${C.reset}`);
+  else console.log(warn('archive contains secrets (.env) — keep it private (file mode set to 600).'));
+}
+
+async function cmdImport(args) {
+  const yes = args.includes('--yes') || args.includes('-y');
+  const file = args.find(a => !a.startsWith('-'));
+  if (!file) { console.log(bad('usage: stoa import <archive.tar.gz> [--yes]')); process.exitCode = 1; return; }
+  const archive = path.resolve(file);
+  if (!fs.existsSync(archive)) { console.log(bad(`file not found: ${archive}`)); process.exitCode = 1; return; }
+
+  const stamp = tsStamp();
+  const stage = path.join(os.tmpdir(), `stoa-import-${stamp}`);
+  fs.rmSync(stage, { recursive: true, force: true });
+  fs.mkdirSync(stage, { recursive: true });
+  const x = spawnSync('tar', ['-xzf', archive, '-C', stage], { stdio: 'ignore' });
+  if (x.status !== 0) { console.log(bad('could not extract archive (not a valid stoa export?).')); fs.rmSync(stage, { recursive: true, force: true }); process.exitCode = 1; return; }
+
+  let manifest = {};
+  try { manifest = JSON.parse(fs.readFileSync(path.join(stage, 'MANIFEST.json'), 'utf8')); } catch {}
+  const has = (n) => fs.existsSync(path.join(stage, n));
+  const items = ['stoa.db', 'config.yaml', 'uploads', '.env'].filter(has);
+  if (!items.length) { console.log(bad('archive has no recognizable Stoa data.')); fs.rmSync(stage, { recursive: true, force: true }); process.exitCode = 1; return; }
+
+  const map = dataMap();
+  console.log(`${C.bold}Import Stoa data${C.reset}`);
+  console.log(`  from:     ${archive.replace(os.homedir(), '~')}`);
+  if (manifest.created_at) console.log(`  created:  ${manifest.created_at}  ${C.gray}(stoa v${manifest.version || '?'}, ${manifest.mode || '?'} mode)${C.reset}`);
+  console.log(`  restores: ${items.join(', ')}`);
+  console.log(`  into:     ${paths.mode()} layout (${paths.serverDir().replace(os.homedir(), '~')})`);
+  console.log(warn('this OVERWRITES the current DB, uploads, and config on this machine.'));
+
+  if (!yes) {
+    const go = await ask(`${C.red}Proceed with import?${C.reset} [y/N] `, 'n');
+    if (go !== 'y' && go !== 'yes') { console.log('Aborted — nothing changed.'); fs.rmSync(stage, { recursive: true, force: true }); return; }
+  }
+
+  // Stop the server so the DB isn't open while we swap it in.
+  const gateway = require('./gateway');
+  let wasRunning = false;
+  try { wasRunning = await probeServer(getPort()); } catch {}
+  if (wasRunning) { console.log('  stopping server…'); try { await gateway.stop(); } catch {} await sleep(800); }
+
+  // Safety net: back up the current data first (with secrets — it's a local file).
+  if (Object.values(map).some(fs.existsSync)) {
+    const pre = path.join(os.tmpdir(), `stoa-prebackup-${stamp}`);
+    fs.rmSync(pre, { recursive: true, force: true });
+    try {
+      await stageData(pre, { withSecrets: true });
+      const backup = path.join(os.homedir(), `stoa-prebackup-${stamp}.tar.gz`);
+      if (spawnSync('tar', ['-czf', backup, '-C', pre, '.'], { stdio: 'ignore' }).status === 0) {
+        try { fs.chmodSync(backup, 0o600); } catch {}
+        console.log(ok(`current data backed up → ${backup.replace(os.homedir(), '~')}`));
+      }
+    } catch (e) { console.log(warn(`pre-import backup failed (${e.message}) — continuing`)); }
+    finally { fs.rmSync(pre, { recursive: true, force: true }); }
+  }
+
+  // Restore each item to its resolved destination.
+  paths.ensureDirs();
+  if (has('stoa.db')) {
+    fs.mkdirSync(path.dirname(map['stoa.db']), { recursive: true });
+    fs.copyFileSync(path.join(stage, 'stoa.db'), map['stoa.db']);
+    for (const suffix of ['-wal', '-shm']) { try { fs.rmSync(map['stoa.db'] + suffix, { force: true }); } catch {} }
+  }
+  if (has('config.yaml')) { fs.mkdirSync(path.dirname(map['config.yaml']), { recursive: true }); fs.copyFileSync(path.join(stage, 'config.yaml'), map['config.yaml']); }
+  if (has('uploads'))     { fs.rmSync(map['uploads'], { recursive: true, force: true }); fs.cpSync(path.join(stage, 'uploads'), map['uploads'], { recursive: true }); }
+  if (has('.env'))        { fs.mkdirSync(path.dirname(map['.env']), { recursive: true }); fs.copyFileSync(path.join(stage, '.env'), map['.env']); try { fs.chmodSync(map['.env'], 0o600); } catch {} }
+  fs.rmSync(stage, { recursive: true, force: true });
+
+  if (wasRunning) { console.log('  starting server…'); try { await gateway.start(); } catch {} }
+  console.log(`\n${C.green}${C.bold}Import complete.${C.reset}`);
+  if (!items.includes('.env')) console.log(`${C.gray}(no .env in archive — set the dashboard login with 'stoa setup' if you need to)${C.reset}`);
+}
+
 // ─── dashboard (open the web UI in a browser) ──────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -609,6 +753,8 @@ function cmdHelp(args) {
     install: 'stoa install\n  Bootstrap on a fresh machine: link the `stoa` command onto PATH + enable the gateway.\n  Run once as `node cli.js install` (the `stoa` command does not exist yet); afterwards use `stoa ...`.\n  Creates .env + config.yaml, asks for your dashboard email/password, then opens the dashboard.\n  Code stays in the repo; data lives in ~/.stoa/server.',
     setup:   'stoa setup\n  Create .env + config.yaml (from the *.example files) if missing, then set the\n  dashboard login (STOA_EMAIL / STOA_PASSWORD in .env). Re-run any time to change it;\n  restart the server to apply (stoa gateway restart).',
     uninstall: 'stoa uninstall [--yes]\n  Remove Stoa: stop & remove the gateway/agent services, unlink the `stoa` command,\n  and delete ~/.stoa. Offers to back up workspace + agent + data (tar.gz in your home) first.\n  Your cloned repo and node_modules are left untouched. --yes skips prompts.',
+    export:  'stoa export [outfile.tar.gz] [--with-secrets]\n  Back up the server data (DB via a consistent SQLite snapshot, uploads/, config.yaml)\n  into a .tar.gz. Default output: ~/stoa-export-<timestamp>.tar.gz (mode 600).\n  .env (dashboard password + infra secrets) is excluded unless you pass --with-secrets.',
+    import:  'stoa import <archive.tar.gz> [--yes]\n  Restore a `stoa export` archive onto this machine: stops the server, backs up the\n  current data to ~/stoa-prebackup-<timestamp>.tar.gz, restores DB/uploads/config\n  (and .env if present), then restarts. OVERWRITES current data. --yes skips the prompt.',
     link:    'stoa link\n  Make the `stoa` command available on PATH (npm link, or a symlink into ~/.local/bin).',
     dashboard: 'stoa dashboard\n  Open the web dashboard in your browser. Starts the gateway first if nothing is running.\n  Targets the installed server (~/.stoa, default :3030), else the dev server from .env.',
     gateway: 'stoa gateway <enable|disable|start|stop|restart|status|logs>\n  Run the server as a native background service (launchd on macOS, systemd on Linux).\n  enable  = start now + autostart on login/boot + restart on crash (data in ~/.stoa/server)\n  disable = stop + remove autostart.  logs -f to follow.  No PM2 required.',
@@ -630,6 +776,8 @@ ${C.bold}Commands:${C.reset}
   ${C.cyan}install${C.reset}            bootstrap: link the \`stoa\` command + enable the gateway
   ${C.cyan}setup${C.reset}              create .env + config.yaml and set the dashboard login
   ${C.cyan}uninstall${C.reset}          remove Stoa (offers to back up workspace + agent + data first)
+  ${C.cyan}export${C.reset} [file]       back up server data (DB + uploads + config) to a .tar.gz
+  ${C.cyan}import${C.reset} <file>       restore a backup archive (overwrites current data)
   ${C.cyan}gateway${C.reset} <cmd>      run server as a background service (enable|disable|start|stop|restart|status|logs)
   ${C.cyan}doctor${C.reset}             diagnose the local setup
   ${C.cyan}update${C.reset}             pull latest code + restart gateway
@@ -658,6 +806,8 @@ function cmdVersion() {
     case 'install':              await cmdInstall(); break;
     case 'setup':                await cmdSetup(); break;
     case 'uninstall':            await cmdUninstall(args); break;
+    case 'export':               await cmdExport(args); break;
+    case 'import':               await cmdImport(args); break;
     case 'link':                       linkCommand(); break;
     case 'gateway':              await cmdGateway(args); break;
     case 'update':               await cmdUpdate(args); break;
